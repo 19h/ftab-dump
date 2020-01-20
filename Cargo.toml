@@ -1,0 +1,28 @@
+[package]
+name = "ftab-dump"
+version = "1.0.0"
+authors = ["Kenan Sulayman <kenan@sig.dev>"]
+license = "MIT"
+description = "Dumps files from 'rkos' ftab firmware images found in Apple micro-devices."
+readme = "readme.md"
+edition = "2018"
+
+[[bin]]
+bench = false
+path = "src/main.rs"
+name = "ftab-dump"
+
+[dependencies]
+byteorder = "1.3.2"
+clap = "2.33.0"
+
+[profile]
+
+[profile.release]
+codegen-units = 1
+debug = false
+debug-assertions = false
+lto = true
+opt-level = 3
+panic = "abort"
+rpath = false
