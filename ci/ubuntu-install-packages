@@ -1,0 +1,3 @@
+#!/bin/sh
+
+sudo dpkg --add-architecture i368
