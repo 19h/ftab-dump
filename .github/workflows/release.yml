@@ -9,19 +9,19 @@ jobs:
     runs-on: ubuntu-latest
     # env:
     # Set to force version number, e.g., when no tag exists.
-    # ZUSE_VERSION: TEST-0.0.0
+    # FTAB_DUMP_VERSION: TEST-0.0.0
     steps:
       - name: Create artifacts directory
         run: mkdir artifacts
 
       - name: Get the release version from the tag
-        if: env.ZUSE_VERSION == ''
+        if: env.FTAB_DUMP_VERSION == ''
         run: |
           # Apparently, this is the right way to get a tag name. Really?
           #
           # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
-          echo "::set-env name=ZUSE_VERSION::${GITHUB_REF#refs/tags/}"
-          echo "version is: ${{ env.ZUSE_VERSION }}"
+          echo "::set-env name=FTAB_DUMP_VERSION::${GITHUB_REF#refs/tags/}"
+          echo "version is: ${{ env.FTAB_DUMP_VERSION }}"
         env:
           ACTIONS_ALLOW_UNSECURE_COMMANDS: true
 
@@ -31,14 +31,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ env.ZUSE_VERSION }}
-          release_name: ${{ env.ZUSE_VERSION }}
+          tag_name: ${{ env.FTAB_DUMP_VERSION }}
+          release_name: ${{ env.FTAB_DUMP_VERSION }}
 
       - name: Save release upload URL to artifact
         run: echo "${{ steps.release.outputs.upload_url }}" > artifacts/release-upload-url
 
       - name: Save version number to artifact
-        run: echo "${{ env.ZUSE_VERSION }}" > artifacts/release-version
+        run: echo "${{ env.FTAB_DUMP_VERSION }}" > artifacts/release-version
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v1
@@ -163,7 +163,7 @@ jobs:
 
       - name: Strip release binary (linux and macos)
         if: matrix.build == 'linux-x64' || matrix.build == 'linux-x86' || matrix.build == 'linux-musl-x86' || matrix.build == 'macos'
-        run: strip "target/${{ matrix.target }}/release/zuse"
+        run: strip "target/${{ matrix.target }}/release/ftab-dump"
 
       - name: Strip release binary (arm)
         if: matrix.build == 'linux-arm'
@@ -172,23 +172,23 @@ jobs:
             "$PWD/target:/target:Z" \
             rustembedded/cross:arm-unknown-linux-gnueabihf \
             arm-linux-gnueabihf-strip \
-            /target/arm-unknown-linux-gnueabihf/release/zuse
+            /target/arm-unknown-linux-gnueabihf/release/ftab-dump
 
       - name: Build archive
         shell: bash
         run: |
           outdir="$(ci/cargo-out-dir "${{ env.TARGET_DIR }}")"
-          staging="zuse-${{ env.RELEASE_VERSION }}-${{ matrix.target }}"
+          staging="ftab-dump-${{ env.RELEASE_VERSION }}-${{ matrix.target }}"
           mkdir -p "$staging"
 
           cp readme.md "$staging/"
 
           if [ "${{ matrix.os }}" = "windows-2019" ]; then
-            cp "target/${{ matrix.target }}/release/zuse.exe" "$staging/"
+            cp "target/${{ matrix.target }}/release/ftab-dump.exe" "$staging/"
             7z a "$staging.zip" "$staging"
             echo "::set-env name=ASSET::$staging.zip"
           else
-            cp "target/${{ matrix.target }}/release/zuse" "$staging/"
+            cp "target/${{ matrix.target }}/release/ftab-dump" "$staging/"
             tar czf "$staging.tar.gz" "$staging"
             echo "::set-env name=ASSET::$staging.tar.gz"
           fi

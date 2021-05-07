@@ -23,7 +23,7 @@ jobs:
     strategy:
       matrix:
         build:
-          # We test zuse on a pinned version of Rust, along with the moving
+          # We test ftab-dump on a pinned version of Rust, along with the moving
           # targets of 'stable' and 'beta' for good measure.
           - pinned
           - stable
@@ -43,7 +43,7 @@ jobs:
         include:
           - build: pinned
             os: ubuntu-18.04
-            rust: 1.41.0
+            rust: 1.52.0
           - build: stable
             os: ubuntu-18.04
             rust: stable
@@ -72,7 +72,7 @@ jobs:
             # docker run --rm -v $PWD/target:/target:Z \
             #   rustembedded/cross:arm-unknown-linux-gnueabihf \
             #   arm-linux-gnueabihf-strip \
-            #   /target/arm-unknown-linux-gnueabihf/debug/zuse
+            #   /target/arm-unknown-linux-gnueabihf/debug/ftab-dump
             target: arm-unknown-linux-gnueabihf
           - build: macos
             os: macos-latest
@@ -116,7 +116,7 @@ jobs:
           echo "cargo command is: ${{ env.CARGO }}"
           echo "target flag is: ${{ env.TARGET_FLAGS }}"
 
-      - name: Build zuse and all crates
+      - name: Build ftab-dump and all crates
         run: ${{ env.CARGO }} build --verbose --all ${{ env.TARGET_FLAGS }}
 
       # This is useful for debugging problems when the expected build artifacts
