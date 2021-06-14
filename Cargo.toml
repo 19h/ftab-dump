@@ -1,6 +1,6 @@
 [package]
 name = "ftab-dump"
-version = "1.0.3-alpha.0"
+version = "1.0.3"
 authors = ["Kenan Sulayman <kenan@sig.dev>"]
 license = "MIT"
 description = "Dumps files from 'rkos' ftab firmware images found in Apple micro-devices."
