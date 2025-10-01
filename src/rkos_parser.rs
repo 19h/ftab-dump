@@ -90,10 +90,14 @@ pub fn parse_ftab<R>(src: &mut R) -> std::io::Result<Ftab>
             src.read_u32::<LittleEndian>()?,
         );
 
-        entries.push(entry.clone());
-
         // pad
         src.read_u32::<LittleEndian>()?;
+
+        if entry.2 <= 0 { // occurs on AirPods Pro 3 firmware
+            continue;
+        }
+
+        entries.push(entry.clone());
 
         if i != 0 {
             let prev_entry = &entries.get(i - 1usize).unwrap();
