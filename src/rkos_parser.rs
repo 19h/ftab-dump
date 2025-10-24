@@ -183,6 +183,11 @@ pub fn parse_ftab_from_bytes(bytes: &[u8], mode: ValidationMode) -> Result<Ftab,
 
         // off+12..+16 reserved
 
+        // Skip zero-length entries, as they are valid placeholders.
+        if payload_len == 0 {
+            continue;
+        }
+
         // Each payload must start at or after the table end
         if payload_off < table_end {
             return Err(FtabError::EntryBeforeTable {
@@ -226,13 +231,3 @@ pub fn parse_ftab_from_bytes(bytes: &[u8], mode: ValidationMode) -> Result<Ftab,
         entries,
     })
 }
-
-//# Convenience: reads the entire reader into memory and parses.
-//pub fn parse_ftab<R: std::io::Read>(src: &mut R) -> std::io::Result<Ftab> {
-//    let mut bytes = Vec::new();
-//
-//    src.read_to_end(&mut bytes)?;
-//
-//    parse_ftab_from_bytes(&bytes, ValidationMode { header_only: false })
-//        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-//}
