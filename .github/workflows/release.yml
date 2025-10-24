@@ -41,9 +41,9 @@ jobs:
         run: echo "${{ env.FTAB_DUMP_VERSION }}" > artifacts/release-version
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         with:
-          name: artifacts
+          name: artifacts-${{ matrix.runs-on }}
           path: artifacts
 
   build-release:
@@ -141,10 +141,11 @@ jobs:
           echo "target dir is: ${{ env.TARGET_DIR }}"
 
       - name: Get release download URL
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v4
         with:
-          name: artifacts
           path: artifacts
+          pattern: artifacts-*
+          merge-multiple: true
 
       - name: Set release upload URL and release version
         shell: bash
