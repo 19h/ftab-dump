@@ -8,6 +8,7 @@ readme = "readme.md"
 edition = "2021"
 categories = ["command-line-utilities", "parser", "embedded"]
 keywords = ["ftab", "firmware", "apple", "container"]
+repository = "https://github.com/19h/ftab-dump"
 
 [[bin]]
 bench = false
