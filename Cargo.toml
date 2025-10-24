@@ -1,11 +1,13 @@
 [package]
 name = "ftab-dump"
-version = "1.0.4-alpha.0"
+version = "1.0.4-alpha.1"
 authors = ["Kenan Sulayman <kenan@sig.dev>"]
 license = "MIT"
-description = "Dumps files from 'rkos' ftab firmware images found in Apple micro-devices."
+description = "Dumps files from FTAB firmware images ('rksoftab' / 'RKSOFTAB') used in Apple micro-devices."
 readme = "readme.md"
-edition = "2018"
+edition = "2021"
+categories = ["command-line-utilities", "parser", "embedded"]
+keywords = ["ftab", "firmware", "apple", "container"]
 
 [[bin]]
 bench = false
@@ -13,8 +15,8 @@ path = "src/main.rs"
 name = "ftab-dump"
 
 [dependencies]
-byteorder = "1.4.3"
-clap = "2.33.3"
+byteorder = "1.5"
+clap = { version = "4.5", features = ["derive"] }
 
 [profile]
 
