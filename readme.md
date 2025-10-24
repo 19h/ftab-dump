@@ -32,13 +32,13 @@ $ ftab-dump -v ftab.bin -o ftab_dump
 
 #### Notes
 
-`cargo` requires a rust installation.
+If you intend to analyze `rkos` files, note that the AirPods Pro 1, 2 and 3 use an Arm Cortex-M4 32-bit RISC CPU with VFPv4 and ThumbV2 instructions using the ARMv7-M architecture with a little endian byte sex.
 
 #### License
 
 ~~ MIT License ~~
 
-Copyright (c) 2020 Kenan Sulayman
+Copyright (c) 2020 - 2025 Kenan Sulayman
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
