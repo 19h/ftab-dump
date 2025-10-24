@@ -1,12 +1,25 @@
 <h1 align="center">ftab-dump</h1>
 
 <h5 align="center">Dumps files from 'rkos' ftab firmware images found in Apple micro-devices.</h5>
-<h5 align="center">
-- AirPods1,1 w/ B188AP (AirPod 1st generation)<br/>
-- AirPods2,1 w/ B288AP (AirPod 2nd generation)<br/>
-- iProd8,1 w/ B298AP (AirPod Pro)<br/>
-- and probably future devices
-</h5>
+<div align="center">
+
+| Device | Firmware Versions (ftab.bin) |
+|--------|------------------------------|
+| AirPods (2nd generation) | 3E751, 2C54, 1A671, 4E71, 3A283, 2D15, 6F21, 6A326, 6A321, 1A691, 2A364, 5B58, 6A300, 5E135, 5E133, 5B59, 1A673, 4C165, 4A400 |
+| AirPods (3rd generation) | 4E71, 6F21, 6A326, 6A321, 6A317, 4C170, 4B66, 4B61, 5B58, 6A300, 5E135, 5E133, 5B59, 4C165 |
+| AirPods Pro (1st generation) | 3E751, 2C54, 2B588, 4E71, 3A283, 2D15, 6F21, 6A326, 6A321, 4A402, 2B584, 5B58, 6A300, 5E135, 5E133, 5B59, 2D27, 4C165, 4A400 |
+| AirPods Pro (2nd generation) | 5B58, 5E135, 5E133, 5A377 |
+| AirPods Max | 3E756, 4E71, 7E101, 7E108, 3C39, 6F21, 6A326, 5B58, 6A300, 5E135, 7E99, 5E133, 5B59, 6F25, 6A324, 3C16, 6A325, 4C165, 4A400 |
+
+These firmware versions use UARP Super Binaries, which require [`uarp-dump`](https://github.com/19h/uarp-dump) to extract the FTAB file from the UARP Super Binary before processing with `ftab-dump`:
+
+| Device | UARP Versions |
+|--------|------------------------------|
+| AirPods (4th generation) | 7B20, 7B19, 7A304, 7E93, 8A356, 8A358 |
+| AirPods Pro (2nd generation) | 7B21, 7B19, 7E93, 6A303, 7A302, 7A305, 6A305, 6B34, 6B32, 6F8, 6F7, 5B58, 5E135, 6A301, 5E133, 5A377, 8A356, 8A358, 7A294 |
+| AirPods Pro (3rd generation) | 8A357, 8A358 |
+
+</div>
 
 <div align="center">
   <a href="https://crates.io/crates/ftab-dump">
