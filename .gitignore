@@ -1,3 +1,5 @@
 /target
 .DS_Store
 .idea
+# Local-only reference material (decompilation dumps); never tracked or packaged.
+/ref

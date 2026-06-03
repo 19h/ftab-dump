@@ -1,6 +1,6 @@
 [package]
 name = "ftab-dump"
-version = "1.4.0"
+version = "1.5.0"
 authors = ["Kenan Sulayman <kenan@sig.dev>"]
 license = "MIT"
 description = "Dumps files from FTAB firmware images ('rkosftab' / 'RKOSFTAB') used in Apple micro-devices."
@@ -9,6 +9,8 @@ edition = "2021"
 categories = ["command-line-utilities", "parser-implementations", "embedded", "encoding", "parsing"]
 keywords = ["ftab", "firmware", "apple", "container"]
 repository = "https://github.com/19h/ftab-dump"
+# Local-only reference material (decompilation dumps) must never be packaged.
+exclude = ["ref/"]
 
 [[bin]]
 bench = false
