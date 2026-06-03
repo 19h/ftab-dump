@@ -173,10 +173,15 @@ fn path_traversal_is_contained() {
         String::from_utf8_lossy(&o.stderr)
     );
 
-    // Both tags must collapse to safe hex names inside `out`, and nothing may
-    // appear outside it.
-    let escaped = s.dir.join("x");
-    assert!(!escaped.exists(), "payload escaped the output directory");
+    // Nothing may appear outside `out`, and each tag must map to its exact
+    // sanitised hex name with the correct payload — pinning the contract, not
+    // just "some separator-free name".
+    assert!(
+        !s.dir.join("x").exists(),
+        "payload escaped the output directory"
+    );
+    assert_eq!(std::fs::read(out.join("2E2E2F78")).unwrap(), b"PWN"); // "../x"
+    assert_eq!(std::fs::read(out.join("612F625C")).unwrap(), b"NOPE"); // "a/b\\"
     let names: Vec<String> = std::fs::read_dir(&out)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -185,6 +190,114 @@ fn path_traversal_is_contained() {
     for name in &names {
         assert!(!name.contains('/') && !name.contains('\\') && name != "." && name != "..");
     }
+}
+
+#[test]
+fn manifest_is_withheld_without_flag() {
+    let s = Scratch::new("nomanifest");
+    let blob = build_ftab(
+        b"rkosftab",
+        &[(*b"rkos", b"AB".to_vec())],
+        Some(b"TICKET"),
+        None,
+        None,
+    );
+    let input = s.write_input("ftab.bin", &blob);
+    let out = s.path("out");
+    // Without --dump-manifest the manifest must not be written.
+    let o = run(&osv(&[&input, Path::new("-o"), &out]));
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.join("rkos").exists());
+    assert!(!out.join("manifest.bin").exists());
+}
+
+#[test]
+fn number_of_files_count_governs_and_overflows() {
+    // A count smaller than the entry list extracts only that many subfiles
+    // (the device reads exactly number_of_files records).
+    let s = Scratch::new("countsmall");
+    let blob = build_ftab(
+        b"rkosftab",
+        &[
+            (*b"aaaa", b"1".to_vec()),
+            (*b"bbbb", b"2".to_vec()),
+            (*b"cccc", b"3".to_vec()),
+        ],
+        None,
+        Some(2),
+        None,
+    );
+    let input = s.write_input("ftab.bin", &blob);
+    let out = s.path("out");
+    let o = run(&osv(&[&input, Path::new("-o"), &out]));
+    assert!(
+        o.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+    assert!(out.join("aaaa").exists() && out.join("bbbb").exists());
+    assert!(!out.join("cccc").exists());
+
+    // A count whose table cannot fit in the file is rejected (hard requirement),
+    // in both strict and lenient modes.
+    let s2 = Scratch::new("countbig");
+    let blob2 = build_ftab(
+        b"rkosftab",
+        &[(*b"rkos", b"AB".to_vec())],
+        None,
+        Some(100_000),
+        None,
+    );
+    let input2 = s2.write_input("ftab.bin", &blob2);
+    for extra in [&[][..], &[Path::new("--lenient")][..]] {
+        let out2 = s2.path("out");
+        let mut argv: Vec<&std::ffi::OsStr> = vec![
+            input2.as_os_str(),
+            Path::new("-o").as_os_str(),
+            out2.as_os_str(),
+        ];
+        argv.extend(extra.iter().map(|p| p.as_os_str()));
+        let o = run(&argv);
+        assert!(
+            !o.status.success(),
+            "count overflow must fail (extra={extra:?})"
+        );
+        assert!(String::from_utf8_lossy(&o.stderr).contains("table"));
+    }
+}
+
+#[test]
+fn incomplete_entry_table_is_rejected() {
+    // Truncating the buffer mid-way through the metadata table means an entry
+    // record cannot be read in full — a hard failure for the device and us.
+    let s = Scratch::new("trunctable");
+    let full = build_ftab(
+        b"rkosftab",
+        &[(*b"aaaa", b"1".to_vec()), (*b"bbbb", b"2".to_vec())],
+        None,
+        None,
+        None,
+    );
+    // Keep the header + first record + half of the second record.
+    let cut = 0x30 + 16 + 8;
+    let blob = build_ftab(
+        b"rkosftab",
+        &[(*b"aaaa", b"1".to_vec()), (*b"bbbb", b"2".to_vec())],
+        None,
+        None,
+        Some(cut),
+    );
+    assert!(blob.len() < full.len());
+    let input = s.write_input("ftab.bin", &blob);
+    let out = s.path("out");
+    let o = run(&osv(&[&input, Path::new("-o"), &out]));
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("table"));
 }
 
 #[test]
@@ -293,7 +406,8 @@ fn refuses_nonempty_dir_without_force() {
     assert!(String::from_utf8_lossy(&o.stderr).contains("not empty"));
     assert!(out.join("preexisting").exists());
 
-    // With -f: succeed.
+    // With -f: succeed. --force merges into the directory (it does not clear
+    // it), so the pre-existing file survives alongside the new output.
     let o = run(&osv(&[&input, Path::new("-o"), &out, Path::new("-f")]));
     assert!(
         o.status.success(),
@@ -301,6 +415,10 @@ fn refuses_nonempty_dir_without_force() {
         String::from_utf8_lossy(&o.stderr)
     );
     assert_eq!(std::fs::read(out.join("rkos")).unwrap(), b"AB");
+    assert!(
+        out.join("preexisting").exists(),
+        "--force should merge, not clear the output directory"
+    );
 }
 
 #[test]

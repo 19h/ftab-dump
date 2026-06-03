@@ -421,15 +421,25 @@ fn parse_entry(
     if mode.lenient {
         let (s, e, truncated) = clamped_bounds(file_len, offset, length);
         if truncated {
-            warnings.push(format!(
-                "entry #{} payload [0x{:X}..0x{:X}] exceeds file length 0x{:X}; clamped to {} of {} bytes",
-                idx,
-                offset,
-                offset.saturating_add(length),
-                file_len,
-                e - s,
-                length
-            ));
+            // Distinguish "offset at/past EOF" (the device's getDataBlock returns
+            // nil with no clamp warning) from a genuine partial overrun, so the
+            // message is accurate rather than reporting a bogus "clamped to 0".
+            if e == s {
+                warnings.push(format!(
+                    "entry #{} payload offset 0x{:X} is at or past file length 0x{:X}; 0 of {} bytes available",
+                    idx, offset, file_len, length
+                ));
+            } else {
+                warnings.push(format!(
+                    "entry #{} payload [0x{:X}..0x{:X}] exceeds file length 0x{:X}; clamped to {} of {} bytes",
+                    idx,
+                    offset,
+                    offset.saturating_add(length),
+                    file_len,
+                    e - s,
+                    length
+                ));
+            }
         }
         Ok(FtabEntry {
             tag,
@@ -631,6 +641,35 @@ mod tests {
         assert!(ftab.entries[0].truncated);
         assert_eq!(ftab.entries[0].length, 0xFFFF);
         assert_eq!(ftab.warnings.len(), 1);
+    }
+
+    #[test]
+    fn lenient_entry_offset_past_eof_yields_empty_with_accurate_warning() {
+        let mut blob = build_ftab(MAGIC_LOWER, &[(*b"rkos", vec![1, 2, 3, 4])], None);
+        let rec = HEADER_SIZE as usize;
+        // Point the payload entirely past EOF (offset and length both overrun).
+        let past = blob.len() as u32 + 0x100;
+        LittleEndian::write_u32(&mut blob[rec + 4..rec + 8], past);
+        LittleEndian::write_u32(&mut blob[rec + 8..rec + 12], 4);
+        let ftab = parse_ftab_from_bytes(&blob, ValidationMode { lenient: true }).unwrap();
+        assert!(ftab.entries[0].data.is_empty());
+        assert!(ftab.entries[0].truncated);
+        assert_eq!(ftab.warnings.len(), 1);
+        // The warning must not claim anything was "clamped" — nothing was readable.
+        assert!(ftab.warnings[0].contains("at or past file length"));
+        assert!(!ftab.warnings[0].contains("clamped"));
+    }
+
+    #[test]
+    fn zero_length_manifest_is_none_even_with_offset() {
+        for lenient in [false, true] {
+            let mut blob = build_ftab(MAGIC_LOWER, &[(*b"rkos", vec![1])], None);
+            // Non-zero offset but zero length must short-circuit to None.
+            LittleEndian::write_u32(&mut blob[0x10..0x14], 0x30);
+            LittleEndian::write_u32(&mut blob[0x14..0x18], 0);
+            let ftab = parse_ftab_from_bytes(&blob, ValidationMode { lenient }).unwrap();
+            assert!(ftab.manifest.is_none(), "lenient={lenient}");
+        }
     }
 
     #[test]

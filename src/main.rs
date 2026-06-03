@@ -158,27 +158,51 @@ fn is_empty_dir(p: &Path) -> std::io::Result<bool> {
     Ok(fs::read_dir(p)?.next().is_none())
 }
 
-/// Returns `true` for bytes safe to use verbatim in a single path component on
-/// every platform we build for (Linux, macOS, Windows). Deliberately strict: a
-/// conservative allowlist of alphanumerics and a few benign punctuation marks.
+/// Returns `true` for bytes that may appear in a path component: a conservative
+/// allowlist of ASCII alphanumerics and a few benign punctuation marks. This
+/// excludes `/` and `\\` (so a tag can never introduce a directory separator);
+/// whole-name portability (aliases, reserved names, trailing dots) is enforced
+/// separately by [`is_portable_basename`].
 fn is_safe_filename_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.')
 }
 
-/// Builds the base filename for a tag: the literal 4CC if it is entirely made
-/// of safe bytes and is not a directory alias, otherwise an 8-hex-digit form.
+/// Names reserved by Windows for DOS devices, which cannot back a regular file
+/// (case-insensitive, with or without an extension).
+const WINDOWS_RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Returns `true` if `s` is safe to use verbatim as a single path component on
+/// every platform we build for (Linux, macOS, Windows). Rejects the directory
+/// aliases `.`/`..`, names Windows silently rewrites (a trailing `.` or space),
+/// and Windows reserved device names — all of which would make the on-disk name
+/// differ from, or fail to match, what the tool reports.
+fn is_portable_basename(s: &str) -> bool {
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    if s.ends_with('.') || s.ends_with(' ') {
+        return false;
+    }
+    let stem = s.split('.').next().unwrap_or(s);
+    !WINDOWS_RESERVED
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(stem))
+}
+
+/// Builds the base filename for a tag: the literal 4CC if every byte is safe and
+/// the whole name is portable, otherwise an 8-hex-digit form.
 fn base_name_for_tag(tag: &[u8; 4]) -> String {
     if tag.iter().all(|&b| is_safe_filename_byte(b)) {
         // Every byte is ASCII, so this is a lossless conversion.
         let s: String = tag.iter().map(|&b| b as char).collect();
-        if s == "." || s == ".." {
-            hex_name(tag)
-        } else {
-            s
+        if is_portable_basename(&s) {
+            return s;
         }
-    } else {
-        hex_name(tag)
     }
+    hex_name(tag)
 }
 
 fn hex_name(tag: &[u8; 4]) -> String {
@@ -224,9 +248,22 @@ mod tests {
     }
 
     #[test]
-    fn dot_only_four_byte_tag_is_not_an_alias() {
-        // "...." is four safe bytes and is a legal, non-alias filename.
-        assert_eq!(base_name_for_tag(b"...."), "....");
+    fn trailing_dot_tag_falls_back_to_hex() {
+        // Windows silently strips trailing dots, so "abc." and "...." (which
+        // would normalize away entirely) must not be used verbatim.
+        assert_eq!(base_name_for_tag(b"abc."), "6162632E");
+        assert_eq!(base_name_for_tag(b"...."), "2E2E2E2E");
+    }
+
+    #[test]
+    fn windows_reserved_names_fall_back_to_hex() {
+        // "com1"/"lpt1" etc. cannot back a regular file on Windows.
+        assert_eq!(base_name_for_tag(b"com1"), "636F6D31");
+        assert_eq!(base_name_for_tag(b"COM9"), "434F4D39");
+        assert_eq!(base_name_for_tag(b"lpt1"), "6C707431");
+        // "com0"/"coms" are NOT reserved and remain literal.
+        assert_eq!(base_name_for_tag(b"com0"), "com0");
+        assert_eq!(base_name_for_tag(b"coms"), "coms");
     }
 
     #[test]
@@ -237,6 +274,8 @@ mod tests {
     #[test]
     fn plain_tag_is_preserved() {
         assert_eq!(base_name_for_tag(b"rkos"), "rkos");
+        assert_eq!(base_name_for_tag(b"fw01"), "fw01");
+        assert_eq!(base_name_for_tag(b"a-b+"), "a-b+");
     }
 
     #[test]
