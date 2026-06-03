@@ -364,6 +364,15 @@ fn parse_manifest(
         return Ok(None);
     }
     if mode.lenient {
+        // The device's `getManifest`/`getDataBlock` returns nil when the
+        // manifest offset is at or past EOF, so there is no manifest to surface.
+        if off >= file_len {
+            warnings.push(format!(
+                "manifest offset 0x{:X} is at or past file length 0x{:X}; no manifest data",
+                off, file_len
+            ));
+            return Ok(None);
+        }
         let (s, e, truncated) = clamped_bounds(file_len, off, len);
         if truncated {
             warnings.push(format!(
@@ -641,6 +650,44 @@ mod tests {
         LittleEndian::write_u32(&mut blob[0x14..0x18], 0xFFFF);
         let err = parse_ftab_from_bytes(&blob, ValidationMode::default()).unwrap_err();
         assert!(matches!(err, FtabError::ManifestOutOfBounds { .. }));
+    }
+
+    #[test]
+    fn lenient_manifest_offset_past_eof_is_none() {
+        let mut blob = build_ftab(MAGIC_LOWER, &[(*b"rkos", vec![1])], None);
+        // Point the manifest entirely past EOF.
+        let past = blob.len() as u32 + 0x100;
+        LittleEndian::write_u32(&mut blob[0x10..0x14], past);
+        LittleEndian::write_u32(&mut blob[0x14..0x18], 16);
+        let ftab = parse_ftab_from_bytes(&blob, ValidationMode { lenient: true }).unwrap();
+        assert!(ftab.manifest.is_none());
+        assert_eq!(ftab.warnings.len(), 1);
+    }
+
+    #[test]
+    fn lenient_manifest_overrun_is_clamped() {
+        // Lay the manifest out as the final region so a clamped overrun maps to
+        // exactly its real bytes (nothing trails it in the file).
+        let mut blob = vec![0u8; HEADER_SIZE as usize];
+        blob[0x20..0x28].copy_from_slice(MAGIC_LOWER);
+        LittleEndian::write_u32(&mut blob[0x28..0x2C], 1);
+        blob.resize(HEADER_SIZE as usize + ENTRY_SIZE as usize, 0); // table
+
+        let payload_off = blob.len() as u32;
+        blob.push(0x11); // 1-byte payload for the single entry
+        let rec = HEADER_SIZE as usize;
+        blob[rec..rec + 4].copy_from_slice(b"rkos");
+        LittleEndian::write_u32(&mut blob[rec + 4..rec + 8], payload_off);
+        LittleEndian::write_u32(&mut blob[rec + 8..rec + 12], 1);
+
+        let manifest_off = blob.len() as u32;
+        blob.extend_from_slice(&[0xAA, 0xBB]); // 2 real manifest bytes at EOF
+        LittleEndian::write_u32(&mut blob[0x10..0x14], manifest_off);
+        LittleEndian::write_u32(&mut blob[0x14..0x18], 0xFFFF); // declared overrun
+
+        let ftab = parse_ftab_from_bytes(&blob, ValidationMode { lenient: true }).unwrap();
+        assert_eq!(ftab.manifest.as_deref(), Some(&[0xAA, 0xBB][..]));
+        assert_eq!(ftab.warnings.len(), 1);
     }
 
     #[test]
