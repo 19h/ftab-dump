@@ -37,6 +37,41 @@ $ cargo install ftab-dump
 $ ftab-dump -v ftab.bin -o ftab_dump
 ```
 
+#### Usage
+
+```
+ftab-dump [OPTIONS] <FTAB_FILE>
+
+  -o, --outdir <DIR>    Output directory (default: ftab_dump)
+  -f, --force           Overwrite into an existing, non-empty directory
+  -v, --verbose         List tags and sizes as they are written
+      --dump-manifest   Also write the manifest ("ticket") block to manifest.bin
+      --lenient         Reproduce the device's tolerant reader: clamp payloads
+                        and the manifest that run past the end of the file to
+                        the bytes actually present (with warnings) instead of
+                        rejecting the image
+```
+
+By default parsing is strict: a payload or manifest whose declared range falls
+outside the file, or a payload that overlaps the header/table, aborts with a
+clear error so truncated or corrupt images are never silently half-extracted.
+`--lenient` mirrors the on-device reader exactly. Subfile filenames come from
+the 4-character tag and are sanitised against path traversal (collisions and
+unsafe tags fall back to an 8-hex-digit name).
+
+#### FTAB format
+
+The layout and validation rules are verified against Apple's on-device reader
+`UARPRTKitFTAB` and cross-checked with B1N4R1 B01's `rkos.py`. All integers are
+little-endian.
+
+The 48-byte (`0x30`) header carries the manifest offset/length at `0x10`/`0x14`,
+the 8-byte magic `rkosftab` / `RKOSFTAB` at `0x20`, and the subfile count at
+`0x28`. It is followed by that many 16-byte metadata records starting at `0x30`,
+each holding a 4CC tag, a payload offset, a payload length, and four reserved
+bytes. Payloads (and the optional manifest) are stored at their absolute
+offsets.
+
 #### Special thanks
 
 - B1N4R1 B01 (<a href="http://twitter.com/b1n4r1b01">Twitter</a> - <a href="https://github.com/b1n4r1b01">Github</a>)
