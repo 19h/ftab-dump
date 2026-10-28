@@ -45,7 +45,10 @@ ftab-dump [OPTIONS] <FTAB_FILE>
   -o, --outdir <DIR>    Output directory (default: ftab_dump)
   -f, --force           Overwrite into an existing, non-empty directory
   -v, --verbose         List tags and sizes as they are written
+  -i, --info            Print header, manifest and file table without writing files
       --dump-manifest   Also write the manifest ("ticket") block to manifest.bin
+      --strict          Treat parser warnings as errors
+      --keep-empty      Also write zero-length placeholder entries
       --lenient         Reproduce the device's tolerant reader: clamp payloads
                         and the manifest that run past the end of the file to
                         the bytes actually present (with warnings) instead of
@@ -55,7 +58,11 @@ ftab-dump [OPTIONS] <FTAB_FILE>
 By default parsing is strict: a payload or manifest whose declared range falls
 outside the file, or a payload that overlaps the header/table, aborts with a
 clear error so truncated or corrupt images are never silently half-extracted.
-`--lenient` mirrors the on-device reader exactly. Subfile filenames come from
+`--lenient` uses the on-device reader's clamping behavior; `--header-only` is
+an alias. `--strict` promotes all parser warnings to errors before any output
+files are written, including when combined with `--lenient` or `--info`.
+Zero-length entries are retained in the table and skipped during extraction
+unless `--keep-empty` is given. Subfile filenames come from
 the 4-character tag and are sanitised against path traversal (collisions and
 unsafe tags fall back to an 8-hex-digit name).
 
@@ -71,6 +78,42 @@ the 8-byte magic `rkosftab` / `RKOSFTAB` at `0x20`, and the subfile count at
 each holding a 4CC tag, a payload offset, a payload length, and four reserved
 bytes. Payloads (and the optional manifest) are stored at their absolute
 offsets.
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0x00 | 4 | generation/version word (device-specific) |
+| 0x04 | 4 | valid flag (normally 0xFFFFFFFF) |
+| 0x08 | 8 | boot nonce |
+| 0x10 | 4 | manifest/ticket offset |
+| 0x14 | 4 | manifest/ticket length |
+| 0x18 | 4 | reserved (zero) |
+| 0x1C | 4 | reserved (zero) |
+| 0x20 | 8 | magic (`rkosftab` or `RKOSFTAB`) |
+| 0x28 | 4 | number of file-table entries |
+| 0x2C | 4 | reserved (zero) |
+| 0x30 | 16 × entries | file table |
+
+Each file-table entry is a four-character tag followed by a little-endian
+payload offset, payload length, and a reserved word. Payloads and the optional
+manifest (the personalization ticket, typically an IM4M blob) are placed after
+the table and 4-byte aligned; the manifest may live directly after the table or
+after the payloads. Zero-length entries are table placeholders.
+
+The entry count is limited by the table fitting in the file; zero entries are
+valid. Alignment, reserved fields, overlapping ranges, duplicate tags, and
+out-of-order entries are reported as warnings. The header labels above describe
+updater conventions; the on-device reader does not interpret every header word.
+A manifest inside the header/table is reported as a warning, while a non-empty
+payload starting there is rejected by default and allowed with `--lenient`.
+
+Useful options:
+
+```shell script
+$ ftab-dump --info ftab.bin            # header, manifest and file table only
+$ ftab-dump --dump-manifest ftab.bin   # also write manifest.bin (ticket)
+$ ftab-dump --strict ftab.bin          # treat parser warnings as errors
+$ ftab-dump --keep-empty ftab.bin      # write zero-length placeholders too
+```
 
 #### Special thanks
 

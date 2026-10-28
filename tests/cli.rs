@@ -441,3 +441,131 @@ fn high_file_count_is_accepted() {
     let count = std::fs::read_dir(&out).unwrap().count();
     assert_eq!(count, 150);
 }
+
+#[test]
+fn info_inspects_manifest_and_placeholders_without_creating_output() {
+    let s = Scratch::new("info");
+    let blob = build_ftab(
+        b"RKOSFTAB",
+        &[(*b"data", b"ABCD".to_vec()), (*b"zero", Vec::new())],
+        Some(b"TICK"),
+        None,
+        None,
+    );
+    let input = s.write_input("ftab.bin", &blob);
+    let out = s.path("out");
+    let o = run(&osv(&[
+        &input,
+        Path::new("-o"),
+        &out,
+        Path::new("--info"),
+        Path::new("--dump-manifest"),
+    ]));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("Magic: RKOSFTAB"), "{stdout}");
+    assert!(
+        stdout.contains("2 entries, 1 payloads, 1 placeholders"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("placement=before payloads"), "{stdout}");
+    assert!(stdout.contains("zero"), "{stdout}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn strict_promotes_warnings_before_info_or_extraction() {
+    let s = Scratch::new("strictwarnings");
+    // A zero valid flag deliberately produces an inspector diagnostic.
+    let mut blob = build_ftab(
+        b"rkosftab",
+        &[(*b"data", b"ABCD".to_vec())],
+        None,
+        None,
+        None,
+    );
+    let input = s.write_input("ftab.bin", &blob);
+    for info in [false, true] {
+        let out = s.path(if info { "info" } else { "dump" });
+        let base_args = [&input, Path::new("-o"), &out];
+        let mut args = osv(&base_args);
+        args.push(std::ffi::OsStr::new("--strict"));
+        if info {
+            args.push(std::ffi::OsStr::new("--info"));
+        }
+        let o = run(&args);
+        assert!(!o.status.success());
+        assert!(String::from_utf8_lossy(&o.stderr).contains("treated as errors by --strict"));
+        assert!(!out.exists());
+    }
+    // Canonical fields permit --strict, including strict inspection.
+    blob[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    let input = s.write_input("canonical.bin", &blob);
+    let out = s.path("canonical");
+    let o = run(&osv(&[
+        &input,
+        Path::new("-o"),
+        &out,
+        Path::new("--strict"),
+        Path::new("--info"),
+    ]));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!out.exists());
+}
+
+#[test]
+fn strict_rejects_lenient_truncation_before_output() {
+    let s = Scratch::new("strictlenient");
+    let mut blob = build_ftab(
+        b"rkosftab",
+        &[(*b"data", b"ABCD".to_vec())],
+        None,
+        None,
+        None,
+    );
+    blob[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    blob.truncate(blob.len() - 2);
+    let input = s.write_input("ftab.bin", &blob);
+    let out = s.path("out");
+    let o = run(&osv(&[
+        &input,
+        Path::new("-o"),
+        &out,
+        Path::new("--lenient"),
+        Path::new("--strict"),
+    ]));
+    assert!(!o.status.success());
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("clamped to 2 of 4 bytes"), "{stderr}");
+    assert!(stderr.contains("treated as errors by --strict"), "{stderr}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn keep_empty_controls_placeholders_but_preserves_truncated_payloads() {
+    let s = Scratch::new("keepempty");
+    let mut blob = build_ftab(
+        b"rkosftab",
+        &[(*b"zero", Vec::new()), (*b"data", b"ABCD".to_vec())],
+        None,
+        None,
+        None,
+    );
+    // The non-empty declared payload is entirely past EOF, so lenient mode
+    // must still emit it even without --keep-empty.
+    blob.truncate(blob.len() - 4);
+    let input = s.write_input("ftab.bin", &blob);
+    for keep in [false, true] {
+        let out = s.path(if keep { "keep" } else { "skip" });
+        let base_args = [&input, Path::new("-o"), &out];
+        let mut args = osv(&base_args);
+        args.push(std::ffi::OsStr::new("--lenient"));
+        if keep {
+            args.push(std::ffi::OsStr::new("--keep-empty"));
+        }
+        let o = run(&args);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(out.join("zero").exists(), keep);
+        assert_eq!(std::fs::read(out.join("data")).unwrap(), b"");
+    }
+}

@@ -39,6 +39,18 @@ struct Cli {
     #[arg(short = 'v', long = "verbose", action = ArgAction::SetTrue)]
     verbose: bool,
 
+    /// Print the FTAB header, manifest, and file table without writing files
+    #[arg(short = 'i', long = "info", action = ArgAction::SetTrue)]
+    info: bool,
+
+    /// Write zero-length placeholder entries as empty files
+    #[arg(long = "keep-empty", action = ArgAction::SetTrue)]
+    keep_empty: bool,
+
+    /// Treat parser warnings as errors
+    #[arg(long = "strict", action = ArgAction::SetTrue)]
+    strict: bool,
+
     /// Dump the optional manifest ("ticket") block, if present, to 'manifest.bin'
     #[arg(long = "dump-manifest", action = ArgAction::SetTrue)]
     dump_manifest: bool,
@@ -81,6 +93,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         eprintln!("warning: {w}");
     }
 
+    if cli.strict && !ftab.warnings.is_empty() {
+        return Err(format!(
+            "{} FTAB warning(s) treated as errors by --strict",
+            ftab.warnings.len()
+        )
+        .into());
+    }
+    if cli.info {
+        print_info(&ftab, bytes.len() as u64);
+        return Ok(());
+    }
+
     // Prepare the output directory.
     if cli.outdir.exists() {
         // A pre-existing non-directory can never receive our output, even with
@@ -106,7 +130,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // Dump the manifest if requested.
     if cli.dump_manifest {
-        if let Some(m) = &ftab.manifest {
+        if let Some(m) = ftab.manifest.as_ref().and_then(|m| m.data.as_ref()) {
             let path = cli.outdir.join("manifest.bin");
             fs::write(&path, m).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
             if cli.verbose {
@@ -121,12 +145,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     // against path traversal, and disambiguated on collision.
     let mut used: HashSet<String> = HashSet::new();
     let mut total: u64 = 0;
+    let mut written = 0;
+    let mut skipped = 0;
 
     for entry in &ftab.entries {
+        if entry.is_placeholder() && !cli.keep_empty {
+            skipped += 1;
+            continue;
+        }
         let fname = make_unique_filename(&entry.tag, &mut used);
         let out = cli.outdir.join(&fname);
         fs::write(&out, &entry.data).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
         total += entry.data.len() as u64;
+        written += 1;
 
         if cli.verbose {
             let note = if entry.truncated { " [TRUNCATED]" } else { "" };
@@ -142,13 +173,87 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    println!(
-        "wrote {} files with a total of {} bytes",
-        ftab.entries.len(),
-        total
-    );
+    println!("wrote {} files with a total of {} bytes", written, total);
+
+    if skipped > 0 {
+        println!("skipped {} zero-length placeholder(s)", skipped);
+    }
 
     Ok(())
+}
+
+fn print_info(ftab: &rkos_parser::Ftab, file_len: u64) {
+    let header = &ftab.header;
+
+    println!("FTAB image: {} bytes", file_len);
+    println!("Magic: {}", ftab.magic_variant.as_str());
+    println!("Generation: {}", header.generation);
+    println!("Valid: 0x{:08X}", header.valid_flag);
+    println!("Boot nonce: 0x{:016X}", header.boot_nonce);
+    println!(
+        "File table: 0x{:X}..0x{:X} ({} entries, {} payloads, {} placeholders)",
+        rkos_parser::HEADER_SIZE,
+        ftab.file_table_end(),
+        header.number_of_files,
+        ftab.payload_count(),
+        ftab.placeholder_count()
+    );
+
+    match &ftab.manifest {
+        Some(m) => println!(
+            "Manifest: offset=0x{:X}, length={}, placement={}",
+            m.offset,
+            m.length,
+            m.placement.as_str()
+        ),
+        None => println!("Manifest: none"),
+    }
+
+    if let Some((lo, hi)) = ftab.payload_span() {
+        println!("Payload span: 0x{:X}..0x{:X}", lo, hi);
+    }
+    println!("Payload bytes: {}", ftab.payload_bytes());
+    println!();
+    println!(
+        "{:<4} {:>4} {:>10} {:>10} {:>10}  NOTE",
+        "TAG", "#", "OFFSET", "LENGTH", "END"
+    );
+
+    for (idx, entry) in ftab.entries.iter().enumerate() {
+        let mut notes = Vec::new();
+        if entry.is_placeholder() {
+            notes.push("placeholder");
+        }
+        if entry.truncated {
+            notes.push("truncated");
+        }
+        if entry.offset % 4 != 0 && !entry.is_placeholder() {
+            notes.push("misaligned");
+        }
+        if let Some(m) = &ftab.manifest {
+            if !entry.is_placeholder()
+                && (entry.offset as u64) < m.end_offset()
+                && (m.offset as u64) < entry.end_offset()
+            {
+                notes.push("overlaps manifest");
+            }
+        }
+
+        println!(
+            "{:<4} {:>4} 0x{:08X} {:>10} 0x{:08X}  {}",
+            entry.tag_string(),
+            idx,
+            entry.offset,
+            entry.length,
+            entry.end_offset(),
+            notes.join(", ")
+        );
+    }
+
+    if !ftab.warnings.is_empty() {
+        println!();
+        println!("Warnings: {}", ftab.warnings.len());
+    }
 }
 
 fn is_empty_dir(p: &Path) -> std::io::Result<bool> {

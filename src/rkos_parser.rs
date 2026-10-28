@@ -1,114 +1,125 @@
 //! FTAB container parser (`rkosftab` / `RKOSFTAB`).
 //!
-//! # Provenance
+//! The on-disk layout below is derived from the FTAB implementations shipped in
+//! Apple's updater libraries (`libauthinstall.dylib`, `libAppleTconUARPUpdater.dylib`)
+//! and cross-checked against `idevicerestore`'s `ftab.h`:
 //!
-//! The layout and validation rules implemented here are derived from, and
-//! verified against, Apple's on-device FTAB reader `UARPRTKitFTAB`
-//! (specifically `-[UARPRTKitFTAB expandFileTable:]`, `-[UARPRTKitFTAB
-//! getDataBlock:offset:]`, `-[UARPRTKitFTAB getManifest]`,
-//! `-[UARPRTKitFTAB processSubfileInfo:]` and the `UARPRTKitFTABSubfile`
-//! accessors), cross-checked against B1N4R1 B01's `rkos.py` and the
-//! idevicerestore `ftab.h` description credited in the project readme.
+//! ```text
+//! offset  size  field
+//! 0x00    4     generation      (device-specific version word)
+//! 0x04    4     valid           (normally 0xFFFFFFFF)
+//! 0x08    8     boot nonce
+//! 0x10    4     manifest offset
+//! 0x14    4     manifest length
+//! 0x18    4     reserved        (zero)
+//! 0x1C    4     reserved        (zero)
+//! 0x20    8     magic           ("rkosftab" / "RKOSFTAB")
+//! 0x28    4     number of files (zero is valid)
+//! 0x2C    4     reserved        (zero)
+//! 0x30    16*N  file table
+//! ```
 //!
-//! # On-disk layout
+//! Each file-table entry is:
 //!
-//! All multi-byte integers are little-endian.
+//! ```text
+//! offset  size  field
+//! 0x00    4     tag (four-character code, never NUL terminated on disk)
+//! 0x04    4     payload offset (absolute, little endian)
+//! 0x08    4     payload length (little endian)
+//! 0x0C    4     reserved (zero)
+//! ```
 //!
-//! Header (48 bytes / `0x30`):
+//! Payloads and the manifest (the personalization ticket, an opaque IM4M blob)
+//! are 4-byte aligned; Apple pads the gaps with zeroes. The manifest may be
+//! placed directly after the file table ("at the top") or after the payloads
+//! ("at the end"); the header records where it lives.
 //!
-//! | Offset | Size | Field             | Notes                                      |
-//! |--------|------|-------------------|--------------------------------------------|
-//! | `0x00` | 4    | reserved/unknown  | not read by the device parser              |
-//! | `0x04` | 4    | reserved/unknown  | not read by the device parser              |
-//! | `0x08` | 8    | reserved/unknown  | not read by the device parser              |
-//! | `0x10` | 4    | `manifest_offset` | "ticket" offset (`getManifest`)            |
-//! | `0x14` | 4    | `manifest_length` | "ticket" length (`getManifest`)            |
-//! | `0x18` | 8    | reserved/unknown  | not read by the device parser              |
-//! | `0x20` | 8    | `magic`           | `rkosftab` or `RKOSFTAB`                    |
-//! | `0x28` | 4    | `number_of_files` | entry count; `0` is valid (empty table)    |
-//! | `0x2C` | 4    | reserved/unknown  | not read by the device parser              |
-//!
-//! Metadata table: `number_of_files` records of 16 bytes each, starting at
-//! `0x30`. Each record:
-//!
-//! | Offset | Size | Field      | Notes                                      |
-//! |--------|------|------------|--------------------------------------------|
-//! | `+0x0` | 4    | `tag`      | 4CC; the device decodes it as UTF-8        |
-//! | `+0x4` | 4    | `offset`   | absolute payload offset                    |
-//! | `+0x8` | 4    | `length`   | payload length                             |
-//! | `+0xC` | 4    | reserved   | ignored                                    |
-//!
-//! # Validation model
-//!
-//! The device enforces these *hard* requirements (failure aborts the parse):
-//!
-//! 1. The 48-byte header must be present.
-//! 2. The magic at `0x20` must be `rkosftab` or `RKOSFTAB`.
-//! 3. Every 16-byte entry record must be fully present, i.e. the whole
-//!    metadata table must fit in the file (`0x30 + 16*number_of_files <=
-//!    file_len`). The device reads entries one at a time and aborts the moment
-//!    a record cannot be read in full.
-//!
-//! For payloads (and the manifest) the device is *lenient*: `getDataBlock`
-//! clamps an out-of-bounds read to the bytes actually available (emitting a
-//! "Can only provide N bytes" warning) rather than failing, and an offset at or
-//! beyond EOF simply yields an empty block. Zero-length entries are kept (as
-//! empty subfiles), not skipped.
-//!
-//! This parser exposes both behaviours via [`ValidationMode`]:
-//!
-//! * **Strict** (default): payloads and the manifest must lie fully within the
-//!   file, and payloads must start at or after the end of the metadata table.
-//!   Any violation is a hard error. This surfaces truncated/corrupt images
-//!   instead of silently emitting partial output.
-//! * **Lenient**: reproduces the device exactly — payloads/manifest are clamped
-//!   to the available bytes and never rejected. Clamping is reported through
-//!   [`Ftab::warnings`].
+//! Header and file-table bounds, magic validation, and lenient clamping follow
+//! the on-device `UARPRTKitFTAB` reader. The entry count is bounded by the table
+//! fitting in the image; empty tables are valid. Default parsing rejects
+//! out-of-bounds reads and non-empty payloads overlapping the table. Lenient
+//! parsing clamps reads to available bytes and reports truncation. Manifest
+//! placement, alignment, reserved words, and cross-entry quirks are reported
+//! as diagnostics for inspection.
 
 use byteorder::{ByteOrder, LittleEndian};
+use std::collections::BTreeMap;
 use std::fmt;
 
-/// Size of the fixed FTAB header, in bytes.
+/// Size of the fixed FTAB header.
 pub const HEADER_SIZE: u64 = 0x30;
-/// Size of a single metadata-table record, in bytes.
-pub const ENTRY_SIZE: u64 = 16;
-
-/// The two magic values accepted by the device, at file offset `0x20`.
+/// Size of one file-table entry.
+pub const ENTRY_SIZE: u64 = 0x10;
+/// The two magic values accepted by the on-device reader.
 pub const MAGIC_LOWER: &[u8; 8] = b"rkosftab";
 pub const MAGIC_UPPER: &[u8; 8] = b"RKOSFTAB";
 
-/// Controls how out-of-bounds payloads and manifests are handled.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ValidationMode {
-    /// When `true`, reproduce the device's lenient `getDataBlock` behaviour:
-    /// clamp out-of-bounds payloads/manifest to the available bytes instead of
-    /// rejecting them. When `false` (the default), any out-of-bounds payload or
-    /// manifest is a hard error.
+    /// Clamp payloads and manifests to available bytes, matching the on-device
+    /// reader. The complete header and file table are required in every mode.
     pub lenient: bool,
 }
 
-/// A single subfile described by the metadata table.
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MagicVariant {
+    RkosFtab,
+    RkosFtabUpper,
+}
+
+impl MagicVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MagicVariant::RkosFtab => "rkosftab",
+            MagicVariant::RkosFtabUpper => "RKOSFTAB",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FtabHeader {
+    /// Generation/version word. Apple logs this as "Generation"; it is not
+    /// always 1 (e.g. some UARP FTABs use 0x09000100).
+    pub generation: u32,
+    pub valid_flag: u32,
+    pub boot_nonce: u64,
+    pub manifest_offset: u32,
+    pub manifest_length: u32,
+    /// Header word at 0x18. Apple writes zero.
+    pub reserved_18: u32,
+    /// Header word at 0x1C. Apple writes zero.
+    pub reserved_1c: u32,
+    pub magic: [u8; 8],
+    pub number_of_files: u32,
+    /// Header word at 0x2C. Apple writes zero.
+    pub reserved_2c: u32,
+}
+
+impl FtabHeader {
+    pub fn magic_variant(&self) -> Option<MagicVariant> {
+        magic_variant(&self.magic)
+    }
+
+    pub fn file_table_end(&self) -> u64 {
+        HEADER_SIZE + (self.number_of_files as u64) * ENTRY_SIZE
+    }
+}
+
+#[derive(Clone)]
 pub struct FtabEntry {
-    /// The raw 4CC tag bytes.
     pub tag: [u8; 4],
-    /// The payload offset as declared in the metadata table.
     pub offset: u32,
-    /// The payload length as declared in the metadata table.
     pub length: u32,
-    /// The bytes actually extracted. Equal in length to `length` unless lenient
-    /// mode clamped an out-of-bounds payload, in which case it is shorter.
+    /// Entry word at 0x0C. Apple writes zero.
+    pub reserved: u32,
+    /// Available payload bytes, clamped to EOF in lenient mode.
     pub data: Vec<u8>,
-    /// `true` if the payload was clamped because it extended past EOF
-    /// (only possible in lenient mode).
     pub truncated: bool,
 }
 
 impl FtabEntry {
-    /// A human-readable rendering of the tag: the ASCII form if every byte is
-    /// printable, otherwise an 8-hex-digit fallback.
     pub fn tag_string(&self) -> String {
-        if self.tag.iter().all(|b| (0x20..=0x7E).contains(b)) {
+        if self.is_printable_tag() {
             String::from_utf8_lossy(&self.tag).to_string()
         } else {
             format!(
@@ -117,59 +128,281 @@ impl FtabEntry {
             )
         }
     }
+
+    pub fn is_printable_tag(&self) -> bool {
+        self.tag.iter().all(|b| (0x20..=0x7E).contains(b))
+    }
+
+    /// Zero-length table slots are placeholders; Apple keeps them in the table
+    /// but their offset carries no payload.
+    pub fn is_placeholder(&self) -> bool {
+        self.length == 0
+    }
+
+    pub fn end_offset(&self) -> u64 {
+        self.offset as u64 + self.length as u64
+    }
 }
 
-/// A parsed FTAB container.
-///
-/// Only the fields the device parser actually interprets are surfaced. The
-/// header words at `0x00..0x10`, `0x18..0x20` and `0x2C..0x30` are not read by
-/// `-[UARPRTKitFTAB expandFileTable:]` and carry no meaning verified by the
-/// references, so they are deliberately not exposed under invented names.
+impl fmt::Debug for FtabEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FtabEntry")
+            .field("tag", &self.tag_string())
+            .field("offset", &self.offset)
+            .field("length", &self.length)
+            .field("reserved", &self.reserved)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestPlacement {
+    /// Directly after the file table, before any payload.
+    BeforePayloads,
+    /// Immediately after the last payload.
+    AfterPayloads,
+    /// Somewhere between payloads (unusual but legal).
+    BetweenPayloads,
+    /// The manifest range overlaps at least one payload.
+    OverlapsPayload,
+    /// Manifest present but there are no payloads to compare against.
+    NoPayloads,
+}
+
+impl ManifestPlacement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ManifestPlacement::BeforePayloads => "before payloads",
+            ManifestPlacement::AfterPayloads => "after payloads",
+            ManifestPlacement::BetweenPayloads => "between payloads",
+            ManifestPlacement::OverlapsPayload => "overlapping payloads",
+            ManifestPlacement::NoPayloads => "no payloads",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct FtabManifest {
+    pub offset: u32,
+    pub length: u32,
+    pub placement: ManifestPlacement,
+    pub data: Option<Vec<u8>>,
+}
+
+impl FtabManifest {
+    pub fn end_offset(&self) -> u64 {
+        self.offset as u64 + self.length as u64
+    }
+}
+
+impl fmt::Debug for FtabManifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FtabManifest")
+            .field("offset", &self.offset)
+            .field("length", &self.length)
+            .field("placement", &self.placement)
+            .field("data_len", &self.data.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FtabWarning {
+    /// Bounds diagnostics from the on-device-compatible lenient reader.
+    TruncatedRead(String),
+    ManifestBeforeTable {
+        off: u64,
+        table_end: u64,
+    },
+    EntryBeforeTable {
+        index: usize,
+        off: u64,
+        table_end: u64,
+    },
+    UnexpectedValidFlag(u32),
+    ReservedHeaderNonZero {
+        offset: u64,
+        value: u32,
+    },
+    ManifestOffsetWithoutLength(u32),
+    ManifestMisaligned {
+        offset: u32,
+    },
+    ManifestOverlapsPayload {
+        entry: usize,
+    },
+    EntryMisaligned {
+        index: usize,
+        offset: u32,
+    },
+    EntryReservedNonZero {
+        index: usize,
+        value: u32,
+    },
+    ZeroLengthPlaceholderOffsetOutOfRange {
+        index: usize,
+        offset: u32,
+    },
+    EntryOutOfOrder {
+        previous: usize,
+        index: usize,
+    },
+    EntriesOverlap {
+        first: usize,
+        second: usize,
+    },
+    DuplicateTag {
+        first: usize,
+        second: usize,
+        tag: String,
+    },
+}
+
+impl fmt::Display for FtabWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use FtabWarning::*;
+
+        match self {
+            TruncatedRead(message) => f.write_str(message),
+            ManifestBeforeTable { off, table_end } => write!(
+                f,
+                "manifest offset 0x{:X} is before table_end 0x{:X}",
+                off, table_end
+            ),
+            EntryBeforeTable {
+                index,
+                off,
+                table_end,
+            } => write!(
+                f,
+                "entry #{} offset 0x{:X} is before table_end 0x{:X}",
+                index, off, table_end
+            ),
+            UnexpectedValidFlag(v) => write!(
+                f,
+                "unexpected valid flag 0x{:08X} (Apple writes 0xFFFFFFFF)",
+                v
+            ),
+            ReservedHeaderNonZero { offset, value } => write!(
+                f,
+                "reserved header word at 0x{:X} is non-zero: 0x{:08X}",
+                offset, value
+            ),
+            ManifestOffsetWithoutLength(off) => write!(
+                f,
+                "manifest offset is 0x{:X} but manifest length is zero",
+                off
+            ),
+            ManifestMisaligned { offset } => {
+                write!(f, "manifest offset 0x{:X} is not 4-byte aligned", offset)
+            }
+            ManifestOverlapsPayload { entry } => write!(f, "manifest overlaps payload #{}", entry),
+            EntryMisaligned { index, offset } => write!(
+                f,
+                "payload #{} offset 0x{:X} is not 4-byte aligned",
+                index, offset
+            ),
+            EntryReservedNonZero { index, value } => write!(
+                f,
+                "payload #{} reserved word is non-zero: 0x{:08X}",
+                index, value
+            ),
+            ZeroLengthPlaceholderOffsetOutOfRange { index, offset } => write!(
+                f,
+                "zero-length placeholder #{} has out-of-range offset 0x{:X}",
+                index, offset
+            ),
+            EntryOutOfOrder { previous, index } => {
+                write!(f, "payload #{} starts before payload #{}", index, previous)
+            }
+            EntriesOverlap { first, second } => {
+                write!(f, "payload #{} overlaps payload #{}", first, second)
+            }
+            DuplicateTag { first, second, tag } => {
+                write!(f, "payloads #{} and #{} share tag {:?}", first, second, tag)
+            }
+        }
+    }
+}
+
 pub struct Ftab {
-    /// The 8-byte magic at `0x20` (`rkosftab` or `RKOSFTAB`).
-    pub magic: [u8; 8],
-    /// The declared entry count from `0x28`.
-    pub number_of_files: u32,
-    /// The manifest ("ticket") blob, if `manifest_length > 0`.
-    pub manifest: Option<Vec<u8>>,
-    /// The parsed subfile entries (including zero-length ones).
+    pub header: FtabHeader,
+    pub magic_variant: MagicVariant,
+    pub manifest: Option<FtabManifest>,
     pub entries: Vec<FtabEntry>,
-    /// Non-fatal anomalies encountered while parsing (e.g. clamped payloads in
-    /// lenient mode).
-    pub warnings: Vec<String>,
+    pub warnings: Vec<FtabWarning>,
+}
+
+impl Ftab {
+    pub fn file_table_end(&self) -> u64 {
+        self.header.file_table_end()
+    }
+
+    pub fn payload_count(&self) -> usize {
+        self.entries.iter().filter(|e| !e.is_placeholder()).count()
+    }
+
+    pub fn placeholder_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.is_placeholder()).count()
+    }
+
+    pub fn payload_bytes(&self) -> u64 {
+        self.entries.iter().map(|e| e.length as u64).sum()
+    }
+
+    /// Lowest/highest occupied payload byte, if any.
+    pub fn payload_span(&self) -> Option<(u64, u64)> {
+        let mut span: Option<(u64, u64)> = None;
+        for entry in self.entries.iter().filter(|e| !e.is_placeholder()) {
+            let start = entry.offset as u64;
+            let end = entry.end_offset();
+            span = Some(match span {
+                Some((lo, hi)) => (lo.min(start), hi.max(end)),
+                None => (start, end),
+            });
+        }
+        span
+    }
 }
 
 impl fmt::Debug for Ftab {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ftab")
-            .field("magic", &String::from_utf8_lossy(&self.magic))
-            .field("number_of_files", &self.number_of_files)
-            .field("manifest_len", &self.manifest.as_ref().map(|m| m.len()))
+            .field("generation", &self.header.generation)
+            .field("valid_flag", &self.header.valid_flag)
+            .field(
+                "boot_nonce",
+                &format_args!("0x{:016X}", self.header.boot_nonce),
+            )
+            .field("magic", &String::from_utf8_lossy(&self.header.magic))
+            .field("number_of_files", &self.header.number_of_files)
+            .field("manifest", &self.manifest)
             .field("entries", &self.entries.len())
             .field("warnings", &self.warnings.len())
             .finish()
     }
 }
 
-/// Errors that abort an FTAB parse.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum FtabError {
-    /// The buffer is too small to contain a required region.
     Truncated(&'static str),
-    /// The magic at `0x20` is neither `rkosftab` nor `RKOSFTAB`.
     InvalidMagic([u8; 8]),
-    /// `number_of_files` is so large that the metadata table cannot fit.
-    TableOutOfBounds { table_end: u64, file_len: u64 },
-    /// (strict mode) The manifest extends past EOF.
-    ManifestOutOfBounds { off: u64, len: u64, file_len: u64 },
-    /// (strict mode) An entry's payload extends past EOF.
+    TableOutOfBounds {
+        table_end: u64,
+        file_len: u64,
+    },
+    ManifestOutOfBounds {
+        off: u64,
+        len: u64,
+        file_len: u64,
+    },
     EntryOutOfBounds {
         idx: usize,
         off: u64,
         len: u64,
         file_len: u64,
     },
-    /// (strict mode) An entry's payload starts before the metadata table ends.
     EntryBeforeTable {
         idx: usize,
         off: u64,
@@ -178,6 +411,7 @@ pub enum FtabError {
 }
 
 impl std::error::Error for FtabError {}
+
 impl fmt::Display for FtabError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use FtabError::*;
@@ -229,6 +463,16 @@ impl fmt::Display for FtabError {
     }
 }
 
+fn magic_variant(magic: &[u8; 8]) -> Option<MagicVariant> {
+    if magic == MAGIC_LOWER {
+        Some(MagicVariant::RkosFtab)
+    } else if magic == MAGIC_UPPER {
+        Some(MagicVariant::RkosFtabUpper)
+    } else {
+        None
+    }
+}
+
 /// Returns `Some((start, end))` as `usize` indices iff `[off, off+len)` lies
 /// fully within a buffer of `file_len` bytes. All arithmetic is performed in
 /// `u64` and the casts to `usize` are only taken once the range is known to be
@@ -256,100 +500,6 @@ fn clamped_bounds(file_len: u64, off: u64, len: u64) -> (usize, usize, bool) {
     let truncated = take < len;
     // `off < file_len` and `off + take <= file_len`, so both casts are exact.
     (off as usize, (off + take) as usize, truncated)
-}
-
-/// Parse an FTAB image from the complete file bytes.
-///
-/// Mirrors `-[UARPRTKitFTAB expandFileTable:]`: it validates the 48-byte
-/// header, the magic, and the presence of the full metadata table, then reads
-/// each subfile. Payload/manifest bounds handling is governed by `mode`
-/// (see [`ValidationMode`]).
-pub fn parse_ftab_from_bytes(bytes: &[u8], mode: ValidationMode) -> Result<Ftab, FtabError> {
-    let file_len = bytes.len() as u64;
-
-    // (1) The full 48-byte header must be present. The device requires
-    // `[getDataBlock:48 offset:0] length == 48`.
-    if file_len < HEADER_SIZE {
-        return Err(FtabError::Truncated("header (need 48 bytes)"));
-    }
-
-    // Header fields (little-endian). Only the fields the device interprets are
-    // read; the remaining header words (0x00..0x10, 0x18..0x20, 0x2C..0x30) are
-    // reserved/unknown and intentionally left untouched.
-    let manifest_offset = LittleEndian::read_u32(&bytes[0x10..0x14]) as u64;
-    let manifest_length = LittleEndian::read_u32(&bytes[0x14..0x18]) as u64;
-
-    let mut magic = [0u8; 8];
-    magic.copy_from_slice(&bytes[0x20..0x28]);
-
-    let number_of_files = LittleEndian::read_u32(&bytes[0x28..0x2C]);
-
-    // (2) Magic check. The device compares the 8 bytes at 0x20 against the
-    // little-endian words 0x42415446534F4B52 ("RKOSFTAB") and
-    // 0x62617466736F6B72 ("rkosftab"); those are the only accepted values.
-    if &magic != MAGIC_UPPER && &magic != MAGIC_LOWER {
-        return Err(FtabError::InvalidMagic(magic));
-    }
-
-    // (3) The whole metadata table must fit. `number_of_files == 0` is a valid,
-    // empty table per the device (it succeeds with no entries). A count large
-    // enough to overflow the file is rejected here, which also bounds every
-    // subsequent index and allocation.
-    let table_len = (number_of_files as u64) * ENTRY_SIZE;
-    let table_end = HEADER_SIZE + table_len; // no overflow: u32*16 + 0x30 < u64::MAX
-    if table_end > file_len {
-        return Err(FtabError::TableOutOfBounds {
-            table_end,
-            file_len,
-        });
-    }
-
-    let mut warnings = Vec::new();
-
-    // Manifest ("ticket"), read at [off=0x10, len=0x14].
-    let manifest = parse_manifest(
-        bytes,
-        file_len,
-        manifest_offset,
-        manifest_length,
-        mode,
-        &mut warnings,
-    )?;
-
-    // Entries. `number_of_files` is bounded by the table fitting in the file,
-    // so this preallocation is bounded by the file size; cap it defensively so
-    // a pathologically large (but in-file) count cannot request an absurd
-    // allocation up front.
-    let mut entries = Vec::with_capacity((number_of_files as usize).min(4096));
-
-    for i in 0..(number_of_files as usize) {
-        let rec = HEADER_SIZE as usize + i * ENTRY_SIZE as usize; // within table_end <= file_len
-        let tag = [bytes[rec], bytes[rec + 1], bytes[rec + 2], bytes[rec + 3]];
-        let payload_off = LittleEndian::read_u32(&bytes[rec + 4..rec + 8]) as u64;
-        let payload_len = LittleEndian::read_u32(&bytes[rec + 8..rec + 12]) as u64;
-        // bytes[rec+12..rec+16] is reserved and ignored.
-
-        let entry = parse_entry(
-            bytes,
-            file_len,
-            table_end,
-            i,
-            tag,
-            payload_off,
-            payload_len,
-            mode,
-            &mut warnings,
-        )?;
-        entries.push(entry);
-    }
-
-    Ok(Ftab {
-        magic,
-        number_of_files,
-        manifest,
-        entries,
-        warnings,
-    })
 }
 
 fn parse_manifest(
@@ -400,6 +550,7 @@ fn parse_entry(
     table_end: u64,
     idx: usize,
     tag: [u8; 4],
+    reserved: u32,
     offset: u64,
     length: u64,
     mode: ValidationMode,
@@ -413,6 +564,7 @@ fn parse_entry(
             tag,
             offset: offset as u32,
             length: 0,
+            reserved,
             data: Vec::new(),
             truncated: false,
         });
@@ -445,6 +597,7 @@ fn parse_entry(
             tag,
             offset: offset as u32,
             length: length as u32,
+            reserved,
             data: bytes[s..e].to_vec(),
             truncated,
         })
@@ -464,6 +617,7 @@ fn parse_entry(
                 tag,
                 offset: offset as u32,
                 length: length as u32,
+                reserved,
                 data: bytes[s..e].to_vec(),
                 truncated: false,
             }),
@@ -477,8 +631,479 @@ fn parse_entry(
     }
 }
 
+fn read_u32(bytes: &[u8], off: usize) -> u32 {
+    LittleEndian::read_u32(&bytes[off..off + 4])
+}
+
+/// Parse and validate a complete FTAB image.
+///
+/// See the module docs for the layout and validation policy. Structural
+/// oddities are returned in
+/// [`Ftab::warnings`].
+pub fn parse_ftab_from_bytes(bytes: &[u8], mode: ValidationMode) -> Result<Ftab, FtabError> {
+    if bytes.len() < HEADER_SIZE as usize {
+        return Err(FtabError::Truncated("header (need 48 bytes)"));
+    }
+
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(&bytes[0x20..0x28]);
+
+    let header = FtabHeader {
+        generation: read_u32(bytes, 0x00),
+        valid_flag: read_u32(bytes, 0x04),
+        boot_nonce: LittleEndian::read_u64(&bytes[0x08..0x10]),
+        manifest_offset: read_u32(bytes, 0x10),
+        manifest_length: read_u32(bytes, 0x14),
+        reserved_18: read_u32(bytes, 0x18),
+        reserved_1c: read_u32(bytes, 0x1C),
+        magic,
+        number_of_files: read_u32(bytes, 0x28),
+        reserved_2c: read_u32(bytes, 0x2C),
+    };
+
+    let magic_variant = header
+        .magic_variant()
+        .ok_or(FtabError::InvalidMagic(header.magic))?;
+
+    let file_len = bytes.len() as u64;
+    let table_start = HEADER_SIZE;
+    let table_end = header.file_table_end();
+
+    if table_end > file_len {
+        return Err(FtabError::TableOutOfBounds {
+            table_end,
+            file_len,
+        });
+    }
+
+    let mut warnings = Vec::new();
+
+    if header.valid_flag != u32::MAX {
+        warnings.push(FtabWarning::UnexpectedValidFlag(header.valid_flag));
+    }
+    for (offset, value) in [
+        (0x18u64, header.reserved_18),
+        (0x1Cu64, header.reserved_1c),
+        (0x2Cu64, header.reserved_2c),
+    ] {
+        if value != 0 {
+            warnings.push(FtabWarning::ReservedHeaderNonZero { offset, value });
+        }
+    }
+
+    // Retain the declared manifest metadata for inspection, including when
+    // lenient reads cannot recover any data at or beyond EOF.
+    let mut manifest = None;
+    if header.manifest_length > 0 {
+        let off = header.manifest_offset as u64;
+        let len = header.manifest_length as u64;
+        let mut bounds_warnings = Vec::new();
+        let data = parse_manifest(bytes, file_len, off, len, mode, &mut bounds_warnings)?;
+        warnings.extend(bounds_warnings.into_iter().map(FtabWarning::TruncatedRead));
+        if off < table_end {
+            warnings.push(FtabWarning::ManifestBeforeTable { off, table_end });
+        }
+        if header.manifest_offset % 4 != 0 {
+            warnings.push(FtabWarning::ManifestMisaligned {
+                offset: header.manifest_offset,
+            });
+        }
+        manifest = Some(FtabManifest {
+            offset: header.manifest_offset,
+            length: header.manifest_length,
+            placement: ManifestPlacement::NoPayloads,
+            data,
+        });
+    } else if header.manifest_offset != 0 {
+        warnings.push(FtabWarning::ManifestOffsetWithoutLength(
+            header.manifest_offset,
+        ));
+    }
+
+    let mut entries = Vec::with_capacity((header.number_of_files as usize).min(4096));
+
+    for i in 0..header.number_of_files as usize {
+        let entry_off = table_start as usize + i * ENTRY_SIZE as usize;
+        let mut tag = [0u8; 4];
+        tag.copy_from_slice(&bytes[entry_off..entry_off + 4]);
+
+        let payload_off = read_u32(bytes, entry_off + 4);
+        let payload_len = read_u32(bytes, entry_off + 8);
+        let reserved = read_u32(bytes, entry_off + 0xC);
+
+        if reserved != 0 {
+            warnings.push(FtabWarning::EntryReservedNonZero {
+                index: i,
+                value: reserved,
+            });
+        }
+
+        if payload_len == 0 {
+            // Placeholders carry no payload. Older images occasionally leave
+            // a bogus offset here, so only flag it instead of failing.
+            if payload_off != 0
+                && ((payload_off as u64) < table_end || payload_off as u64 > file_len)
+            {
+                warnings.push(FtabWarning::ZeroLengthPlaceholderOffsetOutOfRange {
+                    index: i,
+                    offset: payload_off,
+                });
+            }
+            entries.push(FtabEntry {
+                tag,
+                offset: payload_off,
+                length: 0,
+                reserved,
+                data: Vec::new(),
+                truncated: false,
+            });
+            continue;
+        }
+
+        let off = payload_off as u64;
+        let length = payload_len as u64;
+        let mut bounds_warnings = Vec::new();
+        let entry = parse_entry(
+            bytes,
+            file_len,
+            table_end,
+            i,
+            tag,
+            reserved,
+            off,
+            length,
+            mode,
+            &mut bounds_warnings,
+        )?;
+        warnings.extend(bounds_warnings.into_iter().map(FtabWarning::TruncatedRead));
+        if mode.lenient && off < table_end {
+            warnings.push(FtabWarning::EntryBeforeTable {
+                index: i,
+                off,
+                table_end,
+            });
+        }
+        if payload_off % 4 != 0 {
+            warnings.push(FtabWarning::EntryMisaligned {
+                index: i,
+                offset: payload_off,
+            });
+        }
+        entries.push(entry);
+    }
+
+    // Cross-entry diagnostics use O(n log n) time and O(n) auxiliary space
+    // for n entries, emitting at most one overlap witness per payload.
+    let mut sorted: Vec<(usize, u64, u64)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_placeholder())
+        .map(|(i, e)| (i, e.offset as u64, e.end_offset()))
+        .collect();
+    sorted.sort_by_key(|&(_, start, _)| start);
+
+    // Track the furthest end rather than only the preceding entry: a short
+    // nested range must not hide overlaps with an earlier, longer payload.
+    let mut furthest: Option<(usize, u64)> = None;
+    for &(index, start, end) in &sorted {
+        if let Some((first, first_end)) = furthest {
+            if start < first_end {
+                warnings.push(FtabWarning::EntriesOverlap {
+                    first,
+                    second: index,
+                });
+            }
+            if end > first_end {
+                furthest = Some((index, end));
+            }
+        } else {
+            furthest = Some((index, end));
+        }
+    }
+
+    let mut previous: Option<(usize, u64)> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_placeholder() {
+            continue;
+        }
+        let start = entry.offset as u64;
+        if let Some((prev_index, prev_start)) = previous {
+            if start < prev_start {
+                warnings.push(FtabWarning::EntryOutOfOrder {
+                    previous: prev_index,
+                    index,
+                });
+            }
+        }
+        previous = Some((index, start));
+    }
+
+    let mut seen: BTreeMap<[u8; 4], usize> = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.is_placeholder() {
+            continue;
+        }
+        if let Some(&first) = seen.get(&entry.tag) {
+            warnings.push(FtabWarning::DuplicateTag {
+                first,
+                second: index,
+                tag: entry.tag_string(),
+            });
+        } else {
+            seen.insert(entry.tag, index);
+        }
+    }
+
+    // Classify where the manifest lives and whether it collides with a payload.
+    if let Some(manifest) = manifest.as_mut() {
+        let manifest_start = manifest.offset as u64;
+        let manifest_end = manifest.end_offset();
+        let overlap = sorted
+            .iter()
+            .find(|&&(_, start, end)| manifest_start < end && start < manifest_end)
+            .map(|&(index, _, _)| index);
+
+        if let Some(entry) = overlap {
+            warnings.push(FtabWarning::ManifestOverlapsPayload { entry });
+            manifest.placement = ManifestPlacement::OverlapsPayload;
+        } else if sorted.is_empty() {
+            manifest.placement = ManifestPlacement::NoPayloads;
+        } else {
+            let min_start = sorted.first().map(|&(_, start, _)| start).unwrap_or(0);
+            let max_end = sorted.iter().map(|&(_, _, end)| end).max().unwrap_or(0);
+            manifest.placement = if manifest_end <= min_start {
+                ManifestPlacement::BeforePayloads
+            } else if manifest_start >= max_end {
+                ManifestPlacement::AfterPayloads
+            } else {
+                ManifestPlacement::BetweenPayloads
+            };
+        }
+    }
+
+    Ok(Ftab {
+        header,
+        magic_variant,
+        manifest,
+        entries,
+        warnings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn image(
+        files: &[(&[u8; 4], u32, u32)],
+        manifest: Option<(u32, u32)>,
+        file_len: usize,
+    ) -> Vec<u8> {
+        let needed = 0x30 + files.len() * 0x10;
+        let mut bytes = vec![0u8; file_len.max(needed)];
+        LittleEndian::write_u32(&mut bytes[0x00..0x04], 1);
+        LittleEndian::write_u32(&mut bytes[0x04..0x08], u32::MAX);
+        LittleEndian::write_u64(&mut bytes[0x08..0x10], 0x1122334455667788);
+        let (manifest_offset, manifest_length) = manifest.unwrap_or((0, 0));
+        LittleEndian::write_u32(&mut bytes[0x10..0x14], manifest_offset);
+        LittleEndian::write_u32(&mut bytes[0x14..0x18], manifest_length);
+        bytes[0x20..0x28].copy_from_slice(MAGIC_LOWER);
+        LittleEndian::write_u32(&mut bytes[0x28..0x2C], files.len() as u32);
+        for (i, (tag, offset, length)) in files.iter().enumerate() {
+            let base = 0x30 + i * 0x10;
+            bytes[base..base + 4].copy_from_slice(&tag[..]);
+            LittleEndian::write_u32(&mut bytes[base + 4..base + 8], *offset);
+            LittleEndian::write_u32(&mut bytes[base + 8..base + 0xC], *length);
+        }
+        bytes
+    }
+
+    #[test]
+    fn parses_minimal_image() {
+        let mut bytes = image(&[(b"test", 0x40, 4)], None, 0x44);
+        bytes[0x40..0x44].copy_from_slice(b"abcd");
+
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert_eq!(ftab.header.generation, 1);
+        assert_eq!(ftab.header.boot_nonce, 0x1122334455667788);
+        assert_eq!(ftab.magic_variant, MagicVariant::RkosFtab);
+        assert_eq!(ftab.entries.len(), 1);
+        assert_eq!(ftab.entries[0].tag_string(), "test");
+        assert_eq!(ftab.entries[0].data, b"abcd");
+        assert!(ftab.warnings.is_empty(), "{:?}", ftab.warnings);
+    }
+
+    #[test]
+    fn accepts_device_specific_generation_word() {
+        // Real UARP FTABs (e.g. FTAB_1 from Firmware.acsw) carry 0x09000100
+        // here rather than 1.
+        let mut bytes = image(&[(b"test", 0x40, 4)], None, 0x44);
+        LittleEndian::write_u32(&mut bytes[0x00..0x04], 0x0900_0100);
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert_eq!(ftab.header.generation, 0x0900_0100);
+        assert!(ftab.warnings.is_empty(), "{:?}", ftab.warnings);
+    }
+
+    #[test]
+    fn classifies_manifest_after_payloads() {
+        let mut bytes = image(&[(b"test", 0x40, 4)], Some((0x44, 4)), 0x48);
+        bytes[0x40..0x44].copy_from_slice(b"abcd");
+        bytes[0x44..0x48].copy_from_slice(b"MNFT");
+
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        let manifest = ftab.manifest.unwrap();
+        assert_eq!(manifest.placement, ManifestPlacement::AfterPayloads);
+        assert_eq!(manifest.data.unwrap(), b"MNFT");
+    }
+
+    #[test]
+    fn classifies_manifest_before_payloads() {
+        let mut bytes = image(&[(b"test", 0x44, 4)], Some((0x40, 4)), 0x48);
+        bytes[0x40..0x44].copy_from_slice(b"MNFT");
+        bytes[0x44..0x48].copy_from_slice(b"abcd");
+
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert_eq!(
+            ftab.manifest.unwrap().placement,
+            ManifestPlacement::BeforePayloads
+        );
+    }
+
+    #[test]
+    fn keeps_zero_length_placeholders() {
+        let bytes = image(&[(b"test", 0, 0), (b"data", 0x50, 1)], None, 0x51);
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert_eq!(ftab.entries.len(), 2);
+        assert!(ftab.entries[0].is_placeholder());
+        assert_eq!(ftab.payload_count(), 1);
+        assert_eq!(ftab.placeholder_count(), 1);
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let mut bytes = image(&[(b"test", 0x40, 1)], None, 0x41);
+        bytes[0x20..0x28].copy_from_slice(b"nope    ");
+        assert!(matches!(
+            parse_ftab_from_bytes(&bytes, ValidationMode::default()),
+            Err(FtabError::InvalidMagic(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_empty_table_and_rejects_incomplete_table() {
+        let bytes = image(&[], None, 0x30);
+        assert!(parse_ftab_from_bytes(&bytes, ValidationMode::default())
+            .unwrap()
+            .entries
+            .is_empty());
+        let mut bytes = image(&[(b"test", 0x40, 0)], None, 0x40);
+        LittleEndian::write_u32(&mut bytes[0x28..0x2C], u32::MAX);
+        assert!(matches!(
+            parse_ftab_from_bytes(&bytes, ValidationMode::default()),
+            Err(FtabError::TableOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_table_out_of_bounds() {
+        let bytes = image(&[(b"test", 0x40, 0)], None, 0x40);
+        assert!(matches!(
+            parse_ftab_from_bytes(&bytes[..0x38], ValidationMode::default()),
+            Err(FtabError::TableOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_entry_before_table() {
+        let bytes = image(&[(b"test", 0x20, 1)], None, 0x40);
+        assert!(matches!(
+            parse_ftab_from_bytes(&bytes, ValidationMode::default()),
+            Err(FtabError::EntryBeforeTable { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_entry_out_of_bounds() {
+        let bytes = image(&[(b"test", 0x40, 8)], None, 0x44);
+        assert!(matches!(
+            parse_ftab_from_bytes(&bytes, ValidationMode::default()),
+            Err(FtabError::EntryOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn lenient_clamps_out_of_bounds_payloads() {
+        let bytes = image(&[(b"test", 0x40, 8)], None, 0x44);
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode { lenient: true }).unwrap();
+        assert_eq!(ftab.entries[0].length, 8);
+        assert_eq!(ftab.entries[0].data, vec![0; 4]);
+        assert!(ftab.entries[0].truncated);
+    }
+
+    #[test]
+    fn warns_on_manifest_before_table() {
+        let bytes = image(&[(b"test", 0x40, 0)], Some((0x20, 4)), 0x44);
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert!(ftab
+            .warnings
+            .iter()
+            .any(|w| matches!(w, FtabWarning::ManifestBeforeTable { .. })));
+    }
+
+    #[test]
+    fn detects_overlaps_across_nested_ranges() {
+        let bytes = image(
+            &[
+                (b"aaaa", 0x60, 0x40),
+                (b"bbbb", 0x64, 4),
+                (b"cccc", 0x70, 4),
+            ],
+            None,
+            0xA0,
+        );
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert!(ftab.warnings.iter().any(|w| matches!(
+            w,
+            FtabWarning::EntriesOverlap {
+                first: 0,
+                second: 2
+            }
+        )));
+    }
+
+    #[test]
+    fn accepts_counts_above_host_updater_limit_when_table_fits() {
+        let entries = vec![(b"zero", 0, 0); 0x4000];
+        let bytes = image(&entries, None, 0);
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert_eq!(ftab.entries.len(), entries.len());
+    }
+
+    #[test]
+    fn warns_on_misalignment_and_overlap() {
+        let bytes = image(
+            &[(b"aaaa", 0x51, 4), (b"bbbb", 0x53, 4)],
+            Some((0x55, 2)),
+            0x57,
+        );
+        let ftab = parse_ftab_from_bytes(&bytes, ValidationMode::default()).unwrap();
+        assert!(ftab
+            .warnings
+            .iter()
+            .any(|w| matches!(w, FtabWarning::EntryMisaligned { .. })));
+        assert!(ftab
+            .warnings
+            .iter()
+            .any(|w| matches!(w, FtabWarning::EntriesOverlap { .. })));
+        assert!(ftab
+            .warnings
+            .iter()
+            .any(|w| matches!(w, FtabWarning::ManifestOverlapsPayload { .. })));
+    }
+}
+
+#[cfg(test)]
+mod device_reader_tests {
     use super::*;
 
     /// Build a minimal valid FTAB with the given entries `(tag, payload)` and
@@ -532,18 +1157,21 @@ mod tests {
             None,
         );
         let ftab = parse_ftab_from_bytes(&blob, ValidationMode::default()).unwrap();
-        assert_eq!(ftab.number_of_files, 2);
+        assert_eq!(ftab.header.number_of_files, 2);
         assert_eq!(ftab.entries[0].tag, *b"rkos");
         assert_eq!(ftab.entries[0].data, vec![1, 2, 3, 4]);
         assert_eq!(ftab.entries[1].data, vec![9; 10]);
-        assert!(ftab.warnings.is_empty());
+        assert!(!ftab
+            .warnings
+            .iter()
+            .any(|w| matches!(w, FtabWarning::TruncatedRead(_))));
     }
 
     #[test]
     fn parses_uppercase_magic() {
         let blob = build_ftab(MAGIC_UPPER, &[(*b"rkos", vec![7, 7])], None);
         let ftab = parse_ftab_from_bytes(&blob, ValidationMode::default()).unwrap();
-        assert_eq!(&ftab.magic, MAGIC_UPPER);
+        assert_eq!(&ftab.header.magic, MAGIC_UPPER);
         assert_eq!(ftab.entries[0].data, vec![7, 7]);
     }
 
@@ -567,7 +1195,7 @@ mod tests {
     fn zero_files_is_valid_and_empty() {
         let blob = build_ftab(MAGIC_LOWER, &[], None);
         let ftab = parse_ftab_from_bytes(&blob, ValidationMode::default()).unwrap();
-        assert_eq!(ftab.number_of_files, 0);
+        assert_eq!(ftab.header.number_of_files, 0);
         assert!(ftab.entries.is_empty());
     }
 
@@ -616,7 +1244,7 @@ mod tests {
         );
         let ftab = parse_ftab_from_bytes(&blob, ValidationMode::default()).unwrap();
         assert_eq!(
-            ftab.manifest.as_deref(),
+            ftab.manifest.as_ref().and_then(|m| m.data.as_deref()),
             Some(&[0xDE, 0xAD, 0xBE, 0xEF][..])
         );
     }
@@ -640,7 +1268,13 @@ mod tests {
         assert_eq!(ftab.entries[0].data, vec![1, 2, 3, 4]);
         assert!(ftab.entries[0].truncated);
         assert_eq!(ftab.entries[0].length, 0xFFFF);
-        assert_eq!(ftab.warnings.len(), 1);
+        assert_eq!(
+            ftab.warnings
+                .iter()
+                .filter(|w| matches!(w, FtabWarning::TruncatedRead(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -654,10 +1288,28 @@ mod tests {
         let ftab = parse_ftab_from_bytes(&blob, ValidationMode { lenient: true }).unwrap();
         assert!(ftab.entries[0].data.is_empty());
         assert!(ftab.entries[0].truncated);
-        assert_eq!(ftab.warnings.len(), 1);
+        assert_eq!(
+            ftab.warnings
+                .iter()
+                .filter(|w| matches!(w, FtabWarning::TruncatedRead(_)))
+                .count(),
+            1
+        );
         // The warning must not claim anything was "clamped" — nothing was readable.
-        assert!(ftab.warnings[0].contains("at or past file length"));
-        assert!(!ftab.warnings[0].contains("clamped"));
+        assert!(ftab
+            .warnings
+            .iter()
+            .find(|w| matches!(w, FtabWarning::TruncatedRead(_)))
+            .unwrap()
+            .to_string()
+            .contains("at or past file length"));
+        assert!(!ftab
+            .warnings
+            .iter()
+            .find(|w| matches!(w, FtabWarning::TruncatedRead(_)))
+            .unwrap()
+            .to_string()
+            .contains("clamped"));
     }
 
     #[test]
@@ -699,8 +1351,14 @@ mod tests {
         LittleEndian::write_u32(&mut blob[0x10..0x14], past);
         LittleEndian::write_u32(&mut blob[0x14..0x18], 16);
         let ftab = parse_ftab_from_bytes(&blob, ValidationMode { lenient: true }).unwrap();
-        assert!(ftab.manifest.is_none());
-        assert_eq!(ftab.warnings.len(), 1);
+        assert!(ftab.manifest.unwrap().data.is_none());
+        assert_eq!(
+            ftab.warnings
+                .iter()
+                .filter(|w| matches!(w, FtabWarning::TruncatedRead(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -725,8 +1383,17 @@ mod tests {
         LittleEndian::write_u32(&mut blob[0x14..0x18], 0xFFFF); // declared overrun
 
         let ftab = parse_ftab_from_bytes(&blob, ValidationMode { lenient: true }).unwrap();
-        assert_eq!(ftab.manifest.as_deref(), Some(&[0xAA, 0xBB][..]));
-        assert_eq!(ftab.warnings.len(), 1);
+        assert_eq!(
+            ftab.manifest.as_ref().and_then(|m| m.data.as_deref()),
+            Some(&[0xAA, 0xBB][..])
+        );
+        assert_eq!(
+            ftab.warnings
+                .iter()
+                .filter(|w| matches!(w, FtabWarning::TruncatedRead(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
